@@ -1,0 +1,33 @@
+# Upstream Airi framework — cloned separately, not part of our repo
+airi/
+
+# Live2D models from Booth — license prohibits redistribution
+LiveroiD_A_1.2/
+LiveroiD_A-Y02.zip
+LiveroiD_A-Y01.zip
+*.model3.json
+*.moc3
+*.exp3.json
+*.physics3.json
+*.cdi3.json
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Personal Claude Code config (not for team)
+.claude/
+
+# Bun / build artifacts
+.bun/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.pid
+/tmp/

@@ -1,0 +1,18 @@
+{
+  "name": "airi-priority-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Priority queue + 429 fallback proxy between airi and Gemini OpenAI-compatible endpoint",
+  "scripts": {
+    "start": "bun run priority-proxy.ts",
+    "dev": "bun run --watch priority-proxy.ts"
+  },
+  "dependencies": {
+    "hono": "*"
+  },
+  "devDependencies": {
+    "@types/bun": "*",
+    "typescript": "*"
+  }
+}
