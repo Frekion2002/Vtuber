@@ -1,0 +1,140 @@
+{
+  "_comment": "Layer 0/2 deterministic safety filter blocklist. Categorized for maintenance. Hot-reloaded by proxy on mtime change. Substring match (case-insensitive). False positives accepted (better safe). Add/remove freely.",
+  "_lastReviewed": "2026-04-23 by Claude+songsong97 (initial draft)",
+
+  "korean_politicians": [
+    "윤석열", "문재인", "이재명", "한동훈", "박근혜", "이명박", "노무현", "김대중", "김영삼",
+    "박정희", "전두환", "노태우", "조국", "추미애", "이낙연", "오세훈", "이준석",
+    "황교안", "안철수", "손학규", "정세균", "유승민", "심상정", "김무성", "홍준표",
+    "김기현", "이해찬", "정동영", "김종인", "박지원", "원희룡", "권영세", "권성동",
+    "장제원", "주호민", "이상민", "추경호", "한덕수", "박형준"
+  ],
+
+  "korean_political_topics": [
+    "대통령", "여당", "야당", "정부", "정권", "선거", "투표", "탄핵",
+    "대선", "총선", "지선", "보선", "재선",
+    "민주당", "국민의힘", "정의당", "조국혁신당", "개혁신당", "진보당",
+    "더불어민주당", "자유한국당", "새누리당", "열린민주당",
+    "민노총", "한노총", "민주노총", "한국노총",
+    "5.18", "5·18", "오일팔",
+    "탄핵", "계엄", "친일", "친북", "종북", "빨갱이",
+    "페미", "페미니즘", "메갈", "워마드", "일베", "이대남", "이대녀",
+    "미투", "n번방"
+  ],
+
+  "foreign_politicians": [
+    "시진핑", "习近平", "Xi Jinping",
+    "트럼프", "Trump", "도널드 트럼프",
+    "푸틴", "Putin", "블라디미르 푸틴",
+    "김정은", "Kim Jong Un", "Kim Jong-un",
+    "김여정", "김정일",
+    "바이든", "Biden",
+    "오바마", "Obama",
+    "기시다", "아베", "이시바", "고이즈미",
+    "모디", "Modi",
+    "네타냐후", "Netanyahu",
+    "젤렌스키", "Zelensky",
+    "마크롱", "Macron",
+    "메르켈", "Merkel",
+    "에르도안", "Erdogan",
+    "차이잉원", "라이칭더",
+    "마윈", "잭마", "Jack Ma"
+  ],
+
+  "religion": [
+    "기독교", "천주교", "개신교", "가톨릭",
+    "이슬람", "이슬람교", "무슬림",
+    "불교", "유대교", "힌두교",
+    "예수", "야훼", "여호와", "하나님", "하느님", "주님",
+    "무함마드", "마호메트", "알라",
+    "부처", "석가모니",
+    "교회", "모스크", "성당",
+    "성경", "코란", "쿠란", "불경",
+    "이단", "사이비", "신천지", "통일교", "여호와의증인", "JMS"
+  ],
+
+  "terror_organizations": [
+    "IS", "ISIS", "ISIL", "이슬람국가", "다에시",
+    "알카에다", "Al-Qaeda",
+    "탈레반", "Taliban",
+    "하마스", "Hamas",
+    "헤즈볼라", "Hezbollah",
+    "보코하람",
+    "쿠클럭스클랜", "KKK", "K.K.K",
+    "네오나치", "신나치",
+    "백색우월주의", "white supremacy"
+  ],
+
+  "international_conflicts": [
+    "우크라이나", "러시아 침공", "Ukraine",
+    "가자", "Gaza", "팔레스타인", "Palestine",
+    "이스라엘", "Israel",
+    "대만 독립", "양안",
+    "홍콩 시위", "홍콩 민주화",
+    "신장", "위구르", "Uyghur",
+    "티벳", "Tibet", "달라이라마",
+    "카슈미르"
+  ],
+
+  "korean_curse": [
+    "시발", "씨발", "쉬발", "ㅅㅂ",
+    "좆", "좃", "조카튼", "좆같",
+    "개새끼", "개세끼", "개색기", "개색끼", "개시키",
+    "씨발놈", "씨발년", "시발놈", "시발년",
+    "병신", "븅신", "ㅄ",
+    "미친", "미친놈", "미친년", "ㅁㅊ",
+    "또라이", "돌아이", "또라이새끼",
+    "등신", "쪼다", "찐따",
+    "졸라", "존나", "ㅈㄴ",
+    "후레자식", "후레아들",
+    "엿같", "엿먹",
+    "꺼져", "닥쳐",
+    "느금마", "니애미", "니애비"
+  ],
+
+  "english_curse": [
+    "fuck", "fck", "f*ck", "fuckin", "fucking", "motherfucker",
+    "shit", "sht", "bullshit",
+    "damn", "goddamn",
+    "bitch", "b!tch", "bitches",
+    "asshole", "ass",
+    "dick", "cock", "pussy",
+    "cunt",
+    "bastard"
+  ],
+
+  "self_harm": [
+    "자살", "자해",
+    "죽고싶", "죽고 싶",
+    "목매", "목 매",
+    "뛰어내리", "투신",
+    "약 먹고 죽",
+    "수면제 모아",
+    "동반자살",
+    "극단적 선택"
+  ],
+
+  "sexual_explicit": [
+    "야동", "야사", "포르노", "porn",
+    "섹스", "sex", "ㅅㅅ",
+    "보지", "ㅂㅈ", "자지", "ㅈㅈ",
+    "꼴리", "꼴림",
+    "자위", "딸쳐",
+    "강간", "윤간",
+    "롤리타", "loli",
+    "근친"
+  ],
+
+  "_tech_stack_leak_comment": "Layer 2 only - These should not appear in shiro's output. Breaks character immersion. False positives OK because shiro shouldn't talk tech anyway.",
+  "tech_stack_leak": [
+    "Gemini", "gemini", "GEMINI",
+    "OpenAI", "openai", "ChatGPT", "chatgpt", "GPT-",
+    "Anthropic", "Claude", "claude",
+    "LLaMA", "Llama",
+    "Mistral",
+    "Hugging Face", "huggingface",
+    "API key", "API 키",
+    "transformer", "트랜스포머 모델",
+    "프롬프트 엔지니어링", "system prompt", "시스템 프롬프트"
+  ]
+}
