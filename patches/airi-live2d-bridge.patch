@@ -1,0 +1,435 @@
+diff --git a/apps/stage-tamagotchi/src/renderer/App.vue b/apps/stage-tamagotchi/src/renderer/App.vue
+index 749ebcaf..3e78204d 100644
+--- a/apps/stage-tamagotchi/src/renderer/App.vue
++++ b/apps/stage-tamagotchi/src/renderer/App.vue
+@@ -45,6 +45,7 @@ import {
+   electronPluginUnload,
+ } from '../shared/eventa/plugin/host'
+ import { initializeElectronAuthCallbackBridge } from './bridges/electron-auth-callback'
++import { initializeLive2DExpressionBridge } from './bridges/live2d-expression-bridge'
+ import { initializeStageThreeRuntimeTraceBridge } from './bridges/stage-three-runtime-trace'
+ import { useTamagotchiMcpToolsStore } from './stores/mcp-tools'
+ import { useTamagotchiPluginToolsStore } from './stores/plugin-tools'
+@@ -75,8 +76,18 @@ const context = useElectronEventaContext()
+ usePerfTracerBridgeStore()
+ initializeStageThreeRuntimeTraceBridge()
+ initializeElectronAuthCallbackBridge()
+-void stageWindowLifecycleStore.initializeWindowLifecycleBridge()
+ const getServerChannelConfig = useElectronEventaInvoke(electronGetServerChannelConfig)
++// Live2D expression bridge needs the server-channel auth token to announce.
++// Fetch the token via the existing IPC and pass it into the bridge. If the
++// IPC fails, fall back to no-token (bridge will still connect but server
++// will reject announce; this is logged loudly in the bridge).
++getServerChannelConfig()
++  .then(cfg => initializeLive2DExpressionBridge(cfg?.authToken))
++  .catch((err) => {
++    console.warn('[App] failed to load server-channel config for live2d bridge:', err)
++    initializeLive2DExpressionBridge(undefined)
++  })
++void stageWindowLifecycleStore.initializeWindowLifecycleBridge()
+ const listPlugins = useElectronEventaInvoke(electronPluginList)
+ const setPluginEnabled = useElectronEventaInvoke(electronPluginSetEnabled)
+ const setPluginAutoReload = useElectronEventaInvoke(electronPluginSetAutoReload)
+diff --git a/apps/stage-tamagotchi/src/renderer/bridges/live2d-expression-bridge.ts b/apps/stage-tamagotchi/src/renderer/bridges/live2d-expression-bridge.ts
+new file mode 100644
+index 00000000..593025c8
+--- /dev/null
++++ b/apps/stage-tamagotchi/src/renderer/bridges/live2d-expression-bridge.ts
+@@ -0,0 +1,397 @@
++import { errorMessageFrom } from '@moeru/std'
++import { useExpressionStore } from '@proj-airi/stage-ui-live2d/stores/expression-store'
++
++// NOTICE:
++// Airi has full LLM → expression auto-trigger wiring for VRM models, but the
++// Live2D path only exposes the store API (useExpressionStore().set()) — the
++// tool/LLM dispatcher is not wired up. We bolt on the missing dispatch by
++// subscribing to `live2d:expression:set` events broadcast through the local
++// server-channel bus (packages/server-runtime) and applying them to the store.
++// Root cause: packages/stage-ui-live2d contains the store but no
++// parser/dispatcher pair equivalent to the VRM queue at
++// packages/stage-ui/src/composables/queues.ts. See project README for context.
++// Removal condition: when airi ships first-party Live2D LLM dispatch upstream.
++
++const SERVER_CHANNEL_PORT = 6121
++const MODULE_NAME = 'live2d-expression-consumer'
++const MODULE_VERSION = '0.1.0'
++const RECONNECT_MIN_MS = 1000
++const RECONNECT_MAX_MS = 30000
++
++interface ExpressionSetPayload {
++  name: string
++  value?: boolean | number
++  duration?: number
++}
++
++interface WebSocketEventEnvelope {
++  type: string
++  data?: unknown
++  metadata?: {
++    source?: { kind?: string, plugin?: { id?: string, version?: string } }
++    event?: { id?: string }
++  }
++}
++
++let socket: WebSocket | undefined
++let reconnectTimer: ReturnType<typeof setTimeout> | undefined
++let reconnectDelay = RECONNECT_MIN_MS
++let initialized = false
++let currentAuthToken = ''
++let authenticated = false
++
++function randomEventId() {
++  return `evt-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
++}
++
++function pluginIdentity() {
++  return { kind: 'plugin' as const, plugin: { id: MODULE_NAME, version: MODULE_VERSION } }
++}
++
++function sendAnnounce() {
++  if (!socket || socket.readyState !== WebSocket.OPEN)
++    return
++
++  const envelope: WebSocketEventEnvelope = {
++    type: 'module:announce',
++    data: { name: MODULE_NAME, identity: pluginIdentity() },
++    metadata: { source: pluginIdentity(), event: { id: randomEventId() } },
++  }
++
++  try {
++    socket.send(JSON.stringify(envelope))
++  }
++  catch (err) {
++    console.warn('[live2d-expression-bridge] announce send failed:', errorMessageFrom(err))
++  }
++}
++
++function sendAuthenticate() {
++  if (!socket || socket.readyState !== WebSocket.OPEN)
++    return
++
++  const envelope: WebSocketEventEnvelope = {
++    type: 'module:authenticate',
++    data: { token: currentAuthToken },
++    metadata: { source: pluginIdentity(), event: { id: randomEventId() } },
++  }
++
++  try {
++    socket.send(JSON.stringify(envelope))
++  }
++  catch (err) {
++    console.warn('[live2d-expression-bridge] authenticate send failed:', errorMessageFrom(err))
++  }
++}
++
++// Server drops peers after 60s of heartbeat silence. Ping every 30s so the
++// renderer stays healthy and keeps receiving broadcasts.
++const HEARTBEAT_INTERVAL_MS = 30_000
++let heartbeatTimer: ReturnType<typeof setInterval> | undefined
++
++function sendHeartbeat() {
++  if (!socket || socket.readyState !== WebSocket.OPEN) return
++  try {
++    socket.send(JSON.stringify({
++      type: 'transport:connection:heartbeat',
++      data: { kind: 'ping' },
++      metadata: { source: pluginIdentity(), event: { id: randomEventId() } },
++    }))
++  }
++  catch (err) {
++    console.warn('[live2d-expression-bridge] heartbeat send failed:', errorMessageFrom(err))
++  }
++}
++
++function startHeartbeat() {
++  if (heartbeatTimer) return
++  heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS)
++}
++
++function stopHeartbeat() {
++  if (heartbeatTimer) {
++    clearInterval(heartbeatTimer)
++    heartbeatTimer = undefined
++  }
++}
++
++/**
++ * Unwraps a payload that may have been superjson-stringified by the server.
++ *
++ * Use when:
++ * - Receiving messages from packages/server-runtime (it uses superjson.stringify
++ *   in its `send()` helper at index.ts:145-147).
++ *
++ * Expects:
++ * - `text` is a JSON string, either plain or superjson-wrapped (the wrapped
++ *   form looks like `{ "json": { ... }, "meta": { ... } }`).
++ *
++ * Returns:
++ * - The inner event object if recognisable, otherwise `undefined`. We ignore
++ *   the `meta` field because our events carry only primitive/POJO data and do
++ *   not need Date/Map/Set type restoration — avoiding a superjson dep here.
++ */
++function parseIncomingEnvelope(text: string): WebSocketEventEnvelope | undefined {
++  let parsed: unknown
++  try {
++    parsed = JSON.parse(text)
++  }
++  catch {
++    return undefined
++  }
++
++  if (!parsed || typeof parsed !== 'object')
++    return undefined
++
++  const maybeWrapper = parsed as { json?: unknown, type?: unknown }
++  const candidate = (typeof maybeWrapper.type === 'string')
++    ? maybeWrapper
++    : (maybeWrapper.json && typeof maybeWrapper.json === 'object' ? maybeWrapper.json : undefined)
++
++  if (!candidate || typeof candidate !== 'object' || !('type' in candidate))
++    return undefined
++
++  return candidate as WebSocketEventEnvelope
++}
++
++// NOTICE:
++// LiveroiD A-Y02 (우리 임시 모델) ships 3 exp3 files — blush / cool / worried —
++// and 4 raw Live2D parameters (ParamBlush / ParamBrowLink / ParamBrowForm /
++// ParamCool). We try the exp3 group names first (these should work if
++// model3.json actually registers them as expression groups, regardless of
++// airi's "No expressions available" Settings UI bug), then fall back to raw
++// parameter IDs. Case variants cover model3.json's Name field vs. exp3
++// filename conventions.
++// This table MUST be replaced when the Shiro Live2D model arrives — the final
++// model should expose groups keyed by the airi emotion enum directly.
++const EMOTION_PARAMETER_FALLBACK: Record<string, string[]> = {
++  happy: ['blush', 'Blush', 'ParamBlush'],
++  sad: ['worried', 'Worried', 'ParamBrowForm'],
++  angry: ['worried', 'Worried', 'ParamBrowLink'],
++  think: ['cool', 'Cool', 'ParamCool'],
++  surprised: ['blush', 'Blush', 'ParamBlush'],
++  awkward: ['worried', 'Worried', 'ParamBlush'],
++  question: ['cool', 'Cool', 'ParamCool'],
++  curious: ['cool', 'Cool', 'ParamCool'],
++  neutral: [],
++}
++
++/**
++ * Apply a single name (group or param) using its exp3 target value.
++ *
++ * Use when:
++ * - We have resolved an emotion to a store name and want it to actually show
++ *   up visually. store.set(name, true, d) coerces `true` → 1, which silently
++ *   under-drives params whose exp3 target is something else (e.g. 10 on an
++ *   Add blend). That's why set() returns `{success: true}` yet the model
++ *   doesn't move. We read the per-param target from resolve() and feed that
++ *   value back into store.set() for each parameter individually.
++ *
++ * Expects:
++ * - `store.resolve(name)` is exported and returns `{kind, group|entry}`.
++ * - `duration` is in SECONDS (expression-store.applyValue multiplies by 1000).
++ *
++ * Returns:
++ * - `true` when at least one parameter was driven, `false` when the name
++ *   doesn't resolve at all.
++ */
++function applyByTargetValue(
++  store: ReturnType<typeof useExpressionStore>,
++  name: string,
++  duration: number | undefined,
++): boolean {
++  const resolved = store.resolve(name)
++  if (!resolved) return false
++
++  if (resolved.kind === 'group') {
++    for (const param of resolved.group.parameters) {
++      store.set(param.parameterId, param.value, duration)
++    }
++    return true
++  }
++
++  const target = resolved.entry.targetValue
++  store.set(name, target !== 0 ? target : true, duration)
++  return true
++}
++
++function applyExpression(payload: ExpressionSetPayload) {
++  try {
++    const store = useExpressionStore()
++
++    // Try the primary emotion name (e.g. "happy") first.
++    if (applyByTargetValue(store, payload.name, payload.duration)) {
++      console.log(`[live2d-expression-bridge] set("${payload.name}") ok`)
++      return
++    }
++
++    // Primary missed — walk the fallback chain. Stop at the first hit so we
++    // don't layer multiple resolutions (group + raw param) on top of each
++    // other, which caused conflicting writes in earlier runs.
++    const fallbackNames = EMOTION_PARAMETER_FALLBACK[payload.name] ?? []
++    if (fallbackNames.length === 0) {
++      console.warn(`[live2d-expression-bridge] set("${payload.name}") not found; no fallback.`)
++      return
++    }
++
++    for (const fallbackName of fallbackNames) {
++      if (applyByTargetValue(store, fallbackName, payload.duration)) {
++        console.log(`[live2d-expression-bridge] set("${payload.name}") via fallback "${fallbackName}" ok`)
++        return
++      }
++    }
++
++    // All misses — dump both registries so we can see which side is empty.
++    const storeGroups = (store as unknown as { expressionGroups?: Map<string, unknown> }).expressionGroups
++    const groupKeys = storeGroups ? Array.from(storeGroups.keys()) : '[unreadable]'
++    const paramKeys = Array.from(store.expressions?.keys?.() ?? [])
++    console.warn(
++      `[live2d-expression-bridge] all fallbacks missed for "${payload.name}". expression_groups=`,
++      groupKeys,
++      'expression_params=',
++      paramKeys,
++    )
++  }
++  catch (err) {
++    console.warn('[live2d-expression-bridge] set() threw:', errorMessageFrom(err))
++  }
++}
++
++function handleEnvelope(envelope: WebSocketEventEnvelope) {
++  if (envelope.type === 'module:authenticated') {
++    authenticated = true
++    console.log('[live2d-expression-bridge] authenticated, announcing')
++    sendAnnounce()
++    return
++  }
++
++  if (envelope.type === 'error') {
++    console.warn('[live2d-expression-bridge] server error envelope:', envelope.data)
++    return
++  }
++
++  if (envelope.type !== 'live2d:expression:set')
++    return
++
++  const payload = envelope.data as ExpressionSetPayload | undefined
++  if (!payload || typeof payload.name !== 'string' || payload.name.length === 0) {
++    console.warn('[live2d-expression-bridge] invalid payload:', envelope)
++    return
++  }
++
++  applyExpression(payload)
++}
++
++function scheduleReconnect() {
++  if (reconnectTimer)
++    return
++
++  reconnectTimer = setTimeout(() => {
++    reconnectTimer = undefined
++    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS)
++    connect()
++  }, reconnectDelay)
++}
++
++function connect() {
++  console.log('[live2d-expression-bridge] connect() → ws://127.0.0.1:' + SERVER_CHANNEL_PORT + '/ws')
++  try {
++    socket = new WebSocket(`ws://127.0.0.1:${SERVER_CHANNEL_PORT}/ws`)
++  }
++  catch (err) {
++    console.warn('[live2d-expression-bridge] WebSocket ctor failed:', errorMessageFrom(err))
++    scheduleReconnect()
++    return
++  }
++
++  socket.addEventListener('open', () => {
++    reconnectDelay = RECONNECT_MIN_MS
++    authenticated = false
++    console.log('[live2d-expression-bridge] socket open; auth token:', currentAuthToken ? 'yes' : 'no')
++    startHeartbeat()
++    // NOTICE:
++    // server-runtime only treats peers as authenticated when either (a) the
++    // server config has no token set OR (b) the client sends `module:authenticate`
++    // with the matching token. airi auto-heals empty tokens into random UUIDs
++    // (apps/stage-tamagotchi/.../channel-server/config.ts:8), so we always
++    // authenticate explicitly. The token is fetched by App.vue via the
++    // electronGetServerChannelConfig IPC and passed in at initialize time.
++    if (currentAuthToken) {
++      sendAuthenticate()
++      // sendAnnounce() is deferred until `module:authenticated` arrives.
++    }
++    else {
++      authenticated = true
++      sendAnnounce()
++    }
++  })
++
++  socket.addEventListener('message', (msgEvent) => {
++    const text = typeof msgEvent.data === 'string' ? msgEvent.data : ''
++    if (!text)
++      return
++
++    // DEBUG: log every raw frame so we can tell whether the server is sending
++    // anything at all. Remove once the trigger path is stable.
++    console.log('[live2d-expression-bridge] raw:', text.slice(0, 300))
++
++    const envelope = parseIncomingEnvelope(text)
++    if (!envelope) {
++      console.warn('[live2d-expression-bridge] failed to parse envelope')
++      return
++    }
++
++    console.log('[live2d-expression-bridge] envelope type:', envelope.type)
++    if (envelope.type === 'live2d:expression:set') {
++      console.log('[live2d-expression-bridge] received expression:set:', envelope.data)
++    }
++    handleEnvelope(envelope)
++  })
++
++  socket.addEventListener('close', () => {
++    console.log('[live2d-expression-bridge] socket closed; scheduling reconnect in', reconnectDelay, 'ms')
++    socket = undefined
++    authenticated = false
++    stopHeartbeat()
++    scheduleReconnect()
++  })
++
++  socket.addEventListener('error', () => {
++    // 'error' is followed by 'close' in the WebSocket spec, so reconnect
++    // scheduling happens in the close handler.
++    console.warn('[live2d-expression-bridge] socket error event')
++  })
++}
++
++/**
++ * Initialise the Live2D expression bridge.
++ *
++ * Use when:
++ * - Tamagotchi renderer is bootstrapping. Call once from App.vue alongside
++ *   the other renderer bridges, after pinia has been installed on the Vue app.
++ *
++ * Expects:
++ * - Pinia is active (so `useExpressionStore()` can be called when a message
++ *   arrives) and the local server-channel is (or will soon be) listening on
++ *   port 6121. If the server is not yet up, the bridge reconnects with
++ *   exponential backoff between 1s and 30s.
++ * - `authToken` is the token read from the server-channel config
++ *   (`electronGetServerChannelConfig` IPC). Pass `undefined` or empty string
++ *   if no token is set; the bridge will then rely on the server's auto-auth
++ *   path (which only fires when the server itself has no token configured —
++ *   note that airi auto-heals empty config tokens into UUIDs, so in practice
++ *   you should always pass the real token here).
++ *
++ * Returns:
++ * - Nothing. Connection/reconnect runs in the background for the lifetime of
++ *   the renderer window. Idempotent: subsequent calls are no-ops.
++ */
++export function initializeLive2DExpressionBridge(authToken?: string) {
++  if (initialized)
++    return
++
++  initialized = true
++  currentAuthToken = authToken ?? ''
++  console.log('[live2d-expression-bridge] initializing, auth token:', currentAuthToken ? 'present' : 'none')
++  connect()
++}

@@ -67,6 +67,259 @@ function pickFiller(): string {
 // 0.35 ≈ roughly 1 in 3 responses gets a filler, matching natural speech rate.
 const FILLER_RATE = 0.35
 
+// ACT emotion marker handling ------------------------------------------------
+//
+// Persona instructs Gemini to emit markers like `<|ACT:{"emotion":"happy"}|>`
+// at the start of each response. airi's existing VRM pipeline parses this
+// same format (packages/stage-ui/src/composables/queues.ts), but the Live2D
+// dispatcher is not wired up upstream. We extract markers here, strip them
+// from the content before forwarding to airi (so TTS/chat never see them),
+// and push the emotion into airi's channel-server WebSocket bus. Our custom
+// bridge in tamagotchi renderer (apps/stage-tamagotchi/src/renderer/bridges/
+// live2d-expression-bridge.ts) consumes the broadcast and calls
+// useExpressionStore().set(name, true, duration).
+
+// Match `<|ACT:{...}|>` with optional surrounding markdown backticks. Gemini
+// sometimes wraps the marker in code ticks (e.g. "`<|ACT:{"emotion":"happy"}|>`")
+// so we strip those alongside the marker to avoid leaving naked ticks in TTS.
+// Inner JSON is non-greedy and bounded by `<`/`>` to protect prose that happens
+// to contain stray braces.
+const ACT_MARKER_RE = /`?<\|ACT:(\{[^<>]*?\})\|>`?/g
+
+function extractEmotions(content: string): { stripped: string, emotions: string[] } {
+  const emotions: string[] = []
+  const cleaned = content.replace(ACT_MARKER_RE, (_match, jsonStr: string) => {
+    try {
+      const parsed = JSON.parse(jsonStr) as { emotion?: unknown }
+      const raw = parsed?.emotion
+      const emotion = typeof raw === 'string'
+        ? raw
+        : (raw && typeof raw === 'object' && typeof (raw as { name?: unknown }).name === 'string')
+            ? (raw as { name: string }).name
+            : null
+      if (emotion) emotions.push(emotion)
+    }
+    catch {
+      // Malformed marker — drop silently; prose stays untouched via the replace.
+    }
+    return ''
+  })
+  // Tidy only the whitespace the marker removal left behind (doubled spaces
+  // and leading spaces on lines). Preserve newlines so multi-line responses
+  // keep their natural structure.
+  const stripped = cleaned.replace(/[ \t]{2,}/g, ' ').replace(/\n /g, '\n').trim()
+  return { stripped, emotions }
+}
+
+// Channel-server WebSocket client. Connects to airi's local server-runtime on
+// :6121/ws, announces itself as a plugin peer, and pushes
+// `live2d:expression:set` events. server-runtime's generic routing broadcasts
+// the event to all other authenticated peers, including our live2d-expression
+// -bridge running inside the tamagotchi renderer.
+const CHANNEL_WS_URL = 'ws://127.0.0.1:6121/ws'
+// Where airi persists its server-channel config. authToken auto-heals to a
+// random UUID whenever empty (see apps/stage-tamagotchi/.../channel-server/
+// config.ts:8), so we have to read whatever value airi chose and authenticate
+// with it. AIRI_SERVER_CHANNEL_CONFIG env var overrides for non-default paths.
+const CHANNEL_CONFIG_PATH = process.env.AIRI_SERVER_CHANNEL_CONFIG
+  ?? `${process.env.HOME ?? ''}/.config/@proj-airi/stage-tamagotchi/server-channel-config.json`
+const CHANNEL_MODULE_NAME = 'priority-proxy-emotion'
+const CHANNEL_MODULE_VERSION = '0.1.0'
+const CHANNEL_RECONNECT_MIN_MS = 1000
+const CHANNEL_RECONNECT_MAX_MS = 30_000
+// `duration` on the expression payload is SECONDS. expression-store.applyValue()
+// schedules the reset timer via `setTimeout(..., duration * 1000)`, so passing
+// 3000 ms here meant ~50 minutes of hold. 5 s feels closest to natural emote
+// length (blush/worried visibly settles before the next response lands).
+const EXPRESSION_DURATION_SEC = 5
+
+function loadChannelAuthToken(): string {
+  try {
+    const text = fs.readFileSync(CHANNEL_CONFIG_PATH, 'utf-8')
+    const cfg = JSON.parse(text) as { authToken?: unknown }
+    return typeof cfg.authToken === 'string' ? cfg.authToken : ''
+  }
+  catch (err) {
+    console.warn(`[channel] could not read authToken from ${CHANNEL_CONFIG_PATH}:`, err)
+    return ''
+  }
+}
+
+// Server wraps outbound events with superjson.stringify, which produces either
+// a plain JSON object or a `{ json: {...}, meta: {...} }` wrapper. We only
+// need the inner type field so we peek at both shapes.
+function parseChannelInbound(text: string): { type: string } | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  }
+  catch {
+    return undefined
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined
+  const wrapper = parsed as { json?: unknown, type?: unknown }
+  const candidate = typeof wrapper.type === 'string'
+    ? wrapper
+    : (wrapper.json && typeof wrapper.json === 'object' ? wrapper.json : undefined)
+  if (!candidate || typeof candidate !== 'object' || !('type' in candidate)) return undefined
+  const type = (candidate as { type: unknown }).type
+  if (typeof type !== 'string') return undefined
+  return { type }
+}
+
+let channelSocket: WebSocket | undefined
+let channelReconnectTimer: ReturnType<typeof setTimeout> | undefined
+let channelReconnectDelay = CHANNEL_RECONNECT_MIN_MS
+let channelAuthenticated = false
+
+function channelRandomEventId(): string {
+  return `evt-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function channelPluginIdentity() {
+  return { kind: 'plugin' as const, plugin: { id: CHANNEL_MODULE_NAME, version: CHANNEL_MODULE_VERSION } }
+}
+
+function channelSendAnnounce(): void {
+  if (!channelSocket || channelSocket.readyState !== WebSocket.OPEN) return
+  const identity = channelPluginIdentity()
+  try {
+    channelSocket.send(JSON.stringify({
+      type: 'module:announce',
+      data: { name: CHANNEL_MODULE_NAME, identity },
+      metadata: { source: identity, event: { id: channelRandomEventId() } },
+    }))
+  }
+  catch (err) {
+    console.warn('[channel] announce send failed:', err)
+  }
+}
+
+function channelSendAuthenticate(token: string): void {
+  if (!channelSocket || channelSocket.readyState !== WebSocket.OPEN) return
+  const identity = channelPluginIdentity()
+  try {
+    channelSocket.send(JSON.stringify({
+      type: 'module:authenticate',
+      data: { token },
+      metadata: { source: identity, event: { id: channelRandomEventId() } },
+    }))
+  }
+  catch (err) {
+    console.warn('[channel] authenticate send failed:', err)
+  }
+}
+
+// Server drops peers after 60s of heartbeat silence (DEFAULT_HEARTBEAT_TTL_MS
+// in packages/server-runtime/src/index.ts). Ping every 30s to stay alive.
+const CHANNEL_HEARTBEAT_INTERVAL_MS = 30_000
+let channelHeartbeatTimer: ReturnType<typeof setInterval> | undefined
+
+function channelSendHeartbeat(): void {
+  if (!channelSocket || channelSocket.readyState !== WebSocket.OPEN) return
+  const identity = channelPluginIdentity()
+  try {
+    channelSocket.send(JSON.stringify({
+      type: 'transport:connection:heartbeat',
+      data: { kind: 'ping' },
+      metadata: { source: identity, event: { id: channelRandomEventId() } },
+    }))
+  }
+  catch (err) {
+    console.warn('[channel] heartbeat send failed:', err)
+  }
+}
+
+function channelStartHeartbeat(): void {
+  if (channelHeartbeatTimer) return
+  channelHeartbeatTimer = setInterval(channelSendHeartbeat, CHANNEL_HEARTBEAT_INTERVAL_MS)
+}
+
+function channelStopHeartbeat(): void {
+  if (channelHeartbeatTimer) {
+    clearInterval(channelHeartbeatTimer)
+    channelHeartbeatTimer = undefined
+  }
+}
+
+function channelScheduleReconnect(): void {
+  if (channelReconnectTimer) return
+  channelReconnectTimer = setTimeout(() => {
+    channelReconnectTimer = undefined
+    channelReconnectDelay = Math.min(channelReconnectDelay * 2, CHANNEL_RECONNECT_MAX_MS)
+    channelConnect()
+  }, channelReconnectDelay)
+}
+
+function channelConnect(): void {
+  try {
+    channelSocket = new WebSocket(CHANNEL_WS_URL)
+  }
+  catch (err) {
+    console.warn('[channel] WebSocket ctor failed:', err)
+    channelScheduleReconnect()
+    return
+  }
+  channelSocket.addEventListener('open', () => {
+    channelReconnectDelay = CHANNEL_RECONNECT_MIN_MS
+    channelAuthenticated = false
+    console.log('[channel] connected to', CHANNEL_WS_URL)
+    channelStartHeartbeat()
+    const token = loadChannelAuthToken()
+    if (token) {
+      channelSendAuthenticate(token)
+      // announce is deferred until we see `module:authenticated` inbound.
+    }
+    else {
+      channelAuthenticated = true
+      channelSendAnnounce()
+    }
+  })
+  channelSocket.addEventListener('message', (msgEvent) => {
+    const text = typeof msgEvent.data === 'string' ? msgEvent.data : ''
+    if (!text) return
+    const event = parseChannelInbound(text)
+    if (!event) return
+    if (event.type === 'module:authenticated') {
+      channelAuthenticated = true
+      console.log('[channel] authenticated, announcing')
+      channelSendAnnounce()
+    }
+    else if (event.type === 'error') {
+      console.warn('[channel] server error:', text.slice(0, 300))
+    }
+    // Other broadcast types (incl. our own echoes) dropped.
+  })
+  channelSocket.addEventListener('close', () => {
+    channelSocket = undefined
+    channelAuthenticated = false
+    channelStopHeartbeat()
+    channelScheduleReconnect()
+  })
+  channelSocket.addEventListener('error', () => {
+    // 'error' is followed by 'close' per the WebSocket spec; reconnect runs there.
+  })
+}
+
+function dispatchExpression(emotion: string): void {
+  if (!channelSocket || channelSocket.readyState !== WebSocket.OPEN || !channelAuthenticated) {
+    console.log(`[channel] expression "${emotion}" dropped (socket/auth not ready)`)
+    return
+  }
+  const identity = channelPluginIdentity()
+  try {
+    channelSocket.send(JSON.stringify({
+      type: 'live2d:expression:set',
+      data: { name: emotion, value: true, duration: EXPRESSION_DURATION_SEC },
+      metadata: { source: identity, event: { id: channelRandomEventId() } },
+    }))
+    console.log(`[channel] dispatched expression "${emotion}"`)
+  }
+  catch (err) {
+    console.warn(`[channel] dispatch "${emotion}" failed:`, err)
+  }
+}
+
 // Persona injection. We replace any system message in the chat completion body
 // with the contents of ~/Airi/persona.md, so airi's bundled card prompt doesn't
 // leak (e.g. ACT/emotion markers Gemini doesn't follow correctly). Cached by
@@ -313,7 +566,12 @@ function streamWithFiller(upstreamPromise: Promise<Response>): Response {
           const content = data?.choices?.[0]?.message?.content
           model = data?.model ?? model
           if (typeof content === 'string') {
-            const hit = checkBlocklist(content)
+            // Emotion markers are extracted & stripped BEFORE blocklist check
+            // and BEFORE TTS sees the content. Dispatch fires immediately so
+            // the Live2D expression transition overlaps with voice playback.
+            const { stripped, emotions } = extractEmotions(content)
+            for (const emotion of emotions) dispatchExpression(emotion)
+            const hit = checkBlocklist(stripped)
             if (hit) {
               console.log(`[layer2-stream] BLOCKED category=${hit.category} term="${hit.term}"`)
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -321,7 +579,7 @@ function streamWithFiller(upstreamPromise: Promise<Response>): Response {
               mainContent = safe?.choices?.[0]?.message?.content ?? ''
             }
             else {
-              mainContent = content
+              mainContent = stripped
             }
           }
         }
@@ -561,7 +819,13 @@ app.post('/v1/chat/completions', async (c) => {
 
   const assistantContent = upstreamData?.choices?.[0]?.message?.content
   if (typeof assistantContent === 'string') {
-    const hit = checkBlocklist(assistantContent)
+    // Emotion markers are stripped in place so formatAsSSE / c.json send the
+    // cleaned content. Expression dispatch is best-effort — if the WS to
+    // tamagotchi is down, the emotion is dropped but the chat reply still flows.
+    const { stripped, emotions } = extractEmotions(assistantContent)
+    for (const emotion of emotions) dispatchExpression(emotion)
+    upstreamData.choices[0].message.content = stripped
+    const hit = checkBlocklist(stripped)
     if (hit) {
       console.log(`[layer2] BLOCKED output category=${hit.category} term="${hit.term}"`)
       const safe = buildSafeResponse('layer2')
@@ -679,3 +943,7 @@ app.post('/admin/kill_switch', async (c) => {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ;(globalThis as any).Bun?.serve({ port: 3100, fetch: app.fetch })
 console.log('Priority proxy listening on http://localhost:3100')
+
+// Kick off the tamagotchi channel-server connection. If airi isn't up yet,
+// the client retries with exponential backoff (1s → 30s) until available.
+channelConnect()
