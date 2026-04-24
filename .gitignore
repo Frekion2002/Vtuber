@@ -31,3 +31,4 @@ Thumbs.db
 *.log
 *.pid
 /tmp/
+nohup.out

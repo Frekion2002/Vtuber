@@ -33,6 +33,40 @@ const MODEL_PRIMARY = 'gemini-2.5-flash'
 const MODEL_FALLBACK = 'gemini-2.5-flash-lite'
 const API_KEY = process.env.GEMINI_API_KEY ?? ''
 
+// Filler pool for TTS latency masking. First SSE chunk sends a random filler
+// while upstream is still processing, so airi can start TTS immediately.
+// Phrases are <2s, tone-neutral, within shiro's 정중체. No P짱 호칭, no
+// heavy melancholy — keep things versatile so any response can follow naturally.
+const FILLERS: string[] = [
+  '음...',
+  '어...',
+  '어라',
+  '아—',
+  '...음.',
+  '...잠깐만요.',
+  '...그게요.',
+  '어... 그러니까요.',
+  '아, 네.',
+  '...그렇네요.',
+  '...저요?',
+  '어, 그게요.',
+  '음, 네.',
+  '후후, 음...',
+  '...흠.',
+  '어— 음...',
+  '아, 네 네.',
+  '...음, 그래요.',
+]
+
+function pickFiller(): string {
+  return FILLERS[Math.floor(Math.random() * FILLERS.length)]
+}
+
+// Probability of emitting a filler before the main response. Humans don't
+// pause-fill every utterance — sending one on 100% of responses feels robotic.
+// 0.35 ≈ roughly 1 in 3 responses gets a filler, matching natural speech rate.
+const FILLER_RATE = 0.35
+
 // Persona injection. We replace any system message in the chat completion body
 // with the contents of ~/Airi/persona.md, so airi's bundled card prompt doesn't
 // leak (e.g. ACT/emotion markers Gemini doesn't follow correctly). Cached by
@@ -237,6 +271,92 @@ function formatAsSSE(chatCompletion: any): Response {
   })
 }
 
+// Stream a random filler chunk immediately, then the upstream content once its
+// Promise resolves. airi TTS's each SSE chunk as it arrives, so playback begins
+// during upstream wait → perceived latency drops ~1-2s. Layer 2 blocklist still
+// runs on the main content; filler is always sent since it's our own neutral
+// text (no risk of leaking a blocked term).
+function streamWithFiller(upstreamPromise: Promise<Response>): Response {
+  const filler = pickFiller()
+  const encoder = new TextEncoder()
+  const id = `chatcmpl-${Date.now()}`
+  const created = Math.floor(Date.now() / 1000)
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      // Chunk 1: filler — flushed immediately, before upstream resolves.
+      const fillerChunk = {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model: 'filler',
+        choices: [{
+          index: 0,
+          delta: { role: 'assistant', content: `${filler} ` },
+          finish_reason: null,
+        }],
+      }
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(fillerChunk)}\n\n`))
+
+      // Chunk 2: main response (after upstream resolves + Layer 2 check).
+      let mainContent = ''
+      let model = MODEL_PRIMARY
+      try {
+        const upstream = await upstreamPromise
+        if (upstream.status !== 200) {
+          console.warn(`[filler-stream] upstream returned ${upstream.status}`)
+          mainContent = '...죄송해요, 잠시 문제가 생긴 것 같아요.'
+        }
+        else {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const data = await upstream.json() as any
+          const content = data?.choices?.[0]?.message?.content
+          model = data?.model ?? model
+          if (typeof content === 'string') {
+            const hit = checkBlocklist(content)
+            if (hit) {
+              console.log(`[layer2-stream] BLOCKED category=${hit.category} term="${hit.term}"`)
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const safe = buildSafeResponse('layer2') as any
+              mainContent = safe?.choices?.[0]?.message?.content ?? ''
+            }
+            else {
+              mainContent = content
+            }
+          }
+        }
+      }
+      catch (err) {
+        console.warn('[filler-stream] upstream error:', err)
+        mainContent = '...죄송해요, 잠시 문제가 생긴 것 같아요.'
+      }
+
+      const mainChunk = {
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: { content: mainContent },
+          finish_reason: 'stop',
+        }],
+      }
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(mainChunk)}\n\n`))
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+    },
+  })
+}
+
 function loadPersona(): string | null {
   let stat: fs.Stats
   try {
@@ -404,12 +524,21 @@ app.post('/v1/chat/completions', async (c) => {
   }
   const priority = rawPriority as Priority
 
-  const upstream = await new Promise<Response>((resolve, reject) => {
+  const upstreamPromise = new Promise<Response>((resolve, reject) => {
     queues[priority].push({ priority, enqueuedAt: Date.now(), body, resolve, reject })
     drain()
   })
 
-  // Pass non-200 (errors) through as-is so airi can react properly to 429 etc.
+  // Streaming + probability gate: emitting a filler on every response feels
+  // robotic. Only insert one on FILLER_RATE fraction of streaming requests.
+  if (wantStreaming && Math.random() < FILLER_RATE) {
+    return streamWithFiller(upstreamPromise)
+  }
+
+  // All other paths (non-streaming, or streaming without filler): wait for
+  // upstream, apply Layer 2, return.
+  const upstream = await upstreamPromise
+
   if (upstream.status !== 200) {
     const errBody = await upstream.text()
     const forwardHeaders = new Headers()
@@ -420,7 +549,6 @@ app.post('/v1/chat/completions', async (c) => {
     return new Response(errBody, { status: upstream.status, headers: forwardHeaders })
   }
 
-  // Layer 2 — output filter. Scan assistant content. Match → replace.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let upstreamData: any
   try {
